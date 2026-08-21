@@ -1,0 +1,17 @@
+workloader
+dist/
+*.code-workspace
+*.DS_store
+*.log
+*.csv
+!illumio-templates/*.csv
+!workloader-identifier-default.csv
+!*parser-table.csv*
+.vscode/*
+*.yaml
+*.zip
+version_notes
+cmd/virtualserviceimport/*
+templates/*
+jds*
+tmp*

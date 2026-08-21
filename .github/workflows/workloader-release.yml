@@ -1,0 +1,168 @@
+name: Workloader Release
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - version
+      - "**/workloader-release.yml"
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go 1.24
+        uses: actions/setup-go@v1
+        with:
+          go-version: 1.24
+        id: go
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v1
+
+      - name: Get dependencies
+        run: |
+          go mod download
+          sudo apt update
+          sudo apt install -y mingw-w64
+
+      - name: Generate version.rc File
+        run: |
+          VERSION=$(cat version)
+          cat <<EOF > version.rc
+          #include <winver.h>
+
+          VS_VERSION_INFO VERSIONINFO
+          FILEVERSION 1,0,0,0
+          PRODUCTVERSION 1,0,0,0
+          FILEFLAGSMASK 0x3fL
+          FILEFLAGS 0x0L
+          FILEOS VOS_NT_WINDOWS32
+          FILETYPE VFT_APP
+          FILESUBTYPE VFT2_UNKNOWN
+          BEGIN
+              BLOCK "StringFileInfo"
+              BEGIN
+                  BLOCK "040904b0"
+                  BEGIN
+                      VALUE "FileDescription", "Workloader is an open-source CLI tool that leverages the Illumio API to manage resources and automate common tasks."
+                      VALUE "InternalName", "workloader"
+                      VALUE "OriginalFilename", "workloader.exe"
+                      VALUE "ProductName", "Workloader"
+                      VALUE "ProductVersion", "$VERSION"
+                  END
+              END
+              BLOCK "VarFileInfo"
+              BEGIN
+                  VALUE "Translation", 0x0409, 1200
+              END
+          END
+          EOF
+          echo "Generated version.rc with ProductVersion: $VERSION"
+
+      - name: Compile version.rc into version.syso
+        run: |
+          x86_64-w64-mingw32-windres version.rc -O coff -o version.syso
+
+      - name: Get workloader version
+        id: get_version
+        run: |
+          echo "version=$(cat version)" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-list -1 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Make directories and copy CSV files
+        run: |
+          mkdir windows-v${{ steps.get_version.outputs.version }} mac-v${{ steps.get_version.outputs.version }} linux-v${{ steps.get_version.outputs.version }}
+
+      - name: Build Windows executable
+        run: GOOS=windows go build -ldflags "-X github.com/brian1917/workloader/utils.Version=$(cat version) -X github.com/brian1917/workloader/utils.Commit=$(git rev-list -1 HEAD)" -o ./windows-v${{ steps.get_version.outputs.version }}/workloader.exe
+
+      - name: Build Mac executable
+        run: GOOS=darwin go build -ldflags "-X github.com/brian1917/workloader/utils.Version=$(cat version) -X github.com/brian1917/workloader/utils.Commit=$(git rev-list -1 HEAD)" -o ./mac-v${{ steps.get_version.outputs.version }}/workloader
+
+      - name: Build Linux amd64 executable
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-X github.com/brian1917/workloader/utils.Version=$(cat version) -X github.com/brian1917/workloader/utils.Commit=$(git rev-list -1 HEAD)" -o ./linux_amd64-v${{ steps.get_version.outputs.version }}/workloader
+
+      - name: Build Linux ARM executable
+        run: GOOS=linux GOARCH=arm CGO_ENABLED=0 go build -ldflags "-X github.com/brian1917/workloader/utils.Version=$(cat version) -X github.com/brian1917/workloader/utils.Commit=$(git rev-list -1 HEAD)" -o ./linux_arm-v${{ steps.get_version.outputs.version }}/workloader
+
+      - name: Generate SHA256 checksums
+        run: |
+          echo "windows: $(sha256sum ./windows-v${{ steps.get_version.outputs.version }}/workloader.exe)" > checksums.txt
+          echo "mac: $(sha256sum ./mac-v${{ steps.get_version.outputs.version }}/workloader)" >> checksums.txt
+          echo "linux amd64: $(sha256sum ./linux_amd64-v${{ steps.get_version.outputs.version }}/workloader)" >> checksums.txt
+          echo "linux arm: $(sha256sum ./linux_arm-v${{ steps.get_version.outputs.version }}/workloader)" >> checksums.txt
+
+      - name: Create release zip packages
+        run: |
+          zip -r windows-v${{ steps.get_version.outputs.version }}.zip windows-v${{ steps.get_version.outputs.version }}/
+          zip -r mac-v${{ steps.get_version.outputs.version }}.zip mac-v${{ steps.get_version.outputs.version }}/
+          zip -r linux_amd64-v${{ steps.get_version.outputs.version }}.zip linux_amd64-v${{ steps.get_version.outputs.version }}/
+          zip -r linux_arm-v${{ steps.get_version.outputs.version }}.zip linux_arm-v${{ steps.get_version.outputs.version }}/
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          release_name: Release ${{ steps.get_version.outputs.version }}
+          draft: false
+          prerelease: false
+          body_path: ./checksums.txt 
+
+      - name: Upload Windows package
+        id: upload-windows-package
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./windows-v${{ steps.get_version.outputs.version }}.zip
+          asset_name: windows-v${{ steps.get_version.outputs.version }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload Mac package
+        id: upload-mac-package
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./mac-v${{ steps.get_version.outputs.version }}.zip
+          asset_name: mac-v${{ steps.get_version.outputs.version }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload Linux amd64 package
+        id: upload-linux_amd64_-package
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./linux_amd64-v${{ steps.get_version.outputs.version }}.zip
+          asset_name: linux_amd64-v${{ steps.get_version.outputs.version }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload Linux ARM package
+        id: upload-linux_arm-package
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./linux_arm-v${{ steps.get_version.outputs.version }}.zip
+          asset_name: linux_arm-v${{ steps.get_version.outputs.version }}.zip
+          asset_content_type: application/zip
+      
+      - name: Upload checksum file
+        id: upload-checksums
+        uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./checksums.txt
+          asset_name: checksums.txt
+          asset_content_type: text/plain
