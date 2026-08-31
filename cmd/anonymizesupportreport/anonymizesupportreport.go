@@ -81,7 +81,11 @@ func init() {
 var (
 	ipv4Regex       = regexp.MustCompile(`\b(\d{1,3}\.){3}\d{1,3}\b`)
 	ipv6Regex       = regexp.MustCompile(`\b([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b`)
-	emailRegex      = regexp.MustCompile(`[\w\.-]+@[\w\.-]+\.\w+`)
+	// Local/domain parts require non-empty dot-separated labels (no leading,
+	// trailing, or consecutive dots) and a 2+ letter TLD, so hexdump/binary
+	// ASCII columns (e.g. "...A...B...@...H...T") don't false-positive as
+	// emails the way a bare [\w.-]+ char class would.
+	emailRegex = regexp.MustCompile(`\b[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b`)
 	hostFQDNRegex   = regexp.MustCompile(`\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b`)
 	hostSimpleRegex = regexp.MustCompile(`\b[a-zA-Z0-9-]{6,}\b`)
 
@@ -158,6 +162,27 @@ var (
 	// ANSI junk like 32mSUCCESS
 	ansiRegex = regexp.MustCompile(`^\d{1,2}m[A-Z]+$`)
 
+	// The nanosecond-fraction + "Z" (UTC) tail of an RFC3339Nano timestamp
+	// (e.g. "2026-08-04T12:00:00.011415598Z"), left standalone once the
+	// leading dot breaks the word boundary. A real hostname is never pure
+	// digits with a single trailing uppercase "Z" - isNumeric alone doesn't
+	// catch this shape since the "Z" makes it non-numeric.
+	nanosecondTimestampFragmentRegex = regexp.MustCompile(`^\d{6,9}Z$`)
+
+	// Docker/libvirt/Kubernetes auto-generated veth interface names: "veth"
+	// followed by a short random hex suffix (e.g. "veth2101327",
+	// "vethf5dbe55"). Kernel-assigned network interface names, never a real
+	// hostname.
+	vethInterfaceRegex = regexp.MustCompile(`^veth[0-9a-f]{6,10}$`)
+
+	// Numbered Linux kernel worker-thread names from /proc or `ps` output:
+	// per-bdi flush threads ("0-flush-253"), per-CPU XFS threads
+	// ("0-xfs-sync", "1H-xfs-log", "2-xfs-inodegc"), and kblockd
+	// ("1H-kblockd"). The leading number is a CPU/device index, not a
+	// customer-identifying value; no real hostname takes this
+	// number(H?)-word[-number] shape.
+	kernelWorkerThreadRegex = regexp.MustCompile(`^\d+H?-(flush-\d+|xfs-[a-z]+|kblockd)$`)
+
 	// Tokens / API keys / secrets
 	jwtRegex          = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	awsAccessKeyRegex = regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`)
@@ -184,6 +209,16 @@ var (
 	// "[A-Z ]*PRIVATE KEY" header, so one pattern covers both instead of two
 	// overlapping regexes.
 	pemPrivateKeyRegex = regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)
+
+	// PEM-armored public material (certificates, CSRs, public keys, CRLs,
+	// PKCS7 bundles). Not secret, but its base64 body is opaque DER - any
+	// real hostname a cert carries (Subject/SAN) is encoded inside that
+	// DER, never present as a plaintext substring, so the body itself adds
+	// no exposure beyond what it already is. Protected as a whole span (see
+	// pemPublicBlocks in Replace) rather than scanned, since coincidental
+	// hostSimpleRegex/emailRegex matches inside the base64 would otherwise
+	// corrupt the encoding without reducing risk.
+	pemPublicBlockRegex = regexp.MustCompile(`(?s)-----BEGIN (?:CERTIFICATE|CERTIFICATE REQUEST|NEW CERTIFICATE REQUEST|TRUSTED CERTIFICATE|X509 CRL|PUBLIC KEY|PKCS7)-----.*?-----END [A-Z0-9 ]+-----`)
 
 	// Personal names (JSON key/value pairs commonly found in HAR headers/cookies/postData)
 	nameKVRegex = regexp.MustCompile(`(?i)"(first[_-]?name|last[_-]?name|full[_-]?name|display[_-]?name|user[_-]?name|author|owner)"\s*:\s*"([^"]*)"`)
@@ -373,6 +408,13 @@ func looksLikeTime(s string) bool { return timeRegex.MatchString(s) }
 func looksLikeDate(s string) bool { return isoDateRegex.MatchString(s) }
 func isNumeric(s string) bool     { return numericRegex.MatchString(s) }
 func looksLikeHash(s string) bool { return hashRegex.MatchString(s) }
+func looksLikeNanosecondTimestampFragment(s string) bool {
+	return nanosecondTimestampFragmentRegex.MatchString(s)
+}
+func looksLikeVethInterface(s string) bool { return vethInterfaceRegex.MatchString(s) }
+func looksLikeKernelWorkerThread(s string) bool {
+	return kernelWorkerThreadRegex.MatchString(s) || fixedSystemProcessNames[s]
+}
 func looksLikeInternalName(s string) bool {
 	return camelCaseRegex.MatchString(s)
 }
@@ -451,8 +493,53 @@ func looksLikeKubectlColumnHeader(s string) bool {
 	return kubectlColumnHeaders[s]
 }
 
+// looksLikeContainerID reports whether s is a container ID, in any of the
+// forms Docker/containerd derive from it: the bare ID itself (short 12-char
+// or full 64-char hex), a systemd scope-unit name ("docker-<64hex>", the
+// ".scope" suffix already stripped by hostSimpleRegex's word boundary at the
+// dot before this ever runs), or a log-driver/storage-driver artifact name
+// built from it ("<64hex>-json", "<64hex>-init").
 func looksLikeContainerID(s string) bool {
-	return strings.Contains(s, ".scope") || longHexRegex.MatchString(s)
+	if strings.Contains(s, ".scope") {
+		return true
+	}
+	trimmed := strings.TrimPrefix(s, "docker-")
+	trimmed = strings.TrimSuffix(trimmed, "-json")
+	trimmed = strings.TrimSuffix(trimmed, "-init")
+	return longHexRegex.MatchString(trimmed)
+}
+
+// fixedSystemProcessNames are Linux system service/kernel-thread names that
+// never vary by install (no embedded hostname, ID, or other customer-
+// specific data) - confirmed appearing as `ps`/systemd-unit false positives
+// in real bundle data. Kernel worker threads with a variable numeric
+// index/device-major (e.g. "0-flush-253") are matched separately by
+// kernelWorkerThreadRegex instead of listed here.
+var fixedSystemProcessNames = map[string]bool{
+	"lvm2-lvmpolld": true, "lvm2-monitor": true,
+	"NetworkManager-dispatcher": true, "NetworkManager-wait-online": true,
+	"grub2-systemd-integration": true, "containerd-shim-runc-v2": true,
+	"dhclient-eth0": true, "x2dcryptsetup": true,
+	"kcompactd0": true, "ext4-rsv-conver": true,
+}
+
+// dockerInspectFieldNames are `docker inspect`/Moby API JSON schema field
+// names (HostConfig/NetworkSettings struct fields) - schema keys, never
+// customer data, but PascalCase compounds with an embedded ALL-CAPS
+// acronym run (IOps, IPv4, IPAM, ...) that looksLikePascalCaseCompound
+// above doesn't cover (it requires exactly one leading capital per
+// segment, not an acronym run).
+var dockerInspectFieldNames = map[string]bool{
+	"BlkioDeviceReadIOps": true, "BlkioDeviceWriteIOps": true,
+	"ContainerIDFile": true, "EnableIPv4": true, "EnableIPv6": true,
+	"GlobalIPv6Address": true, "GlobalIPv6PrefixLen": true,
+	"IOMaximumBandwidth": true, "IOMaximumIOps": true, "IPAMConfig": true,
+	"IPPrefixLen": true, "IPReversePathFilter": true, "IPv4Address": true,
+	"IPv6Address": true, "IPv6Gateway": true, "SecondaryIPAddresses": true,
+}
+
+func looksLikeDockerInspectField(s string) bool {
+	return dockerInspectFieldNames[s]
 }
 
 func looksLikeFilename(s string) bool {
@@ -909,6 +996,17 @@ func isMostlyText(data []byte) bool {
 // Replace logic
 func (m *Mapper) Replace(content string) string {
 
+	// Shield PEM public-material blocks from every pass below with a
+	// placeholder, then restore the original bytes verbatim at the end -
+	// see pemPublicBlockRegex for why these spans are left untouched
+	// rather than scanned.
+	var pemPublicBlocks []string
+	content = pemPublicBlockRegex.ReplaceAllStringFunc(content, func(s string) string {
+		placeholder := fmt.Sprintf("\x00%d\x00", len(pemPublicBlocks))
+		pemPublicBlocks = append(pemPublicBlocks, s)
+		return placeholder
+	})
+
 	content = ipv4Regex.ReplaceAllStringFunc(content, func(s string) string {
 		return m.get(s, "IPV4", m.ipv4)
 	})
@@ -1049,7 +1147,9 @@ func (m *Mapper) Replace(content string) string {
 
 		if looksRandom(s) ||
 			looksLikeUUID(s) ||
-			looksLikeContainerID(s) {
+			looksLikeContainerID(s) ||
+			looksLikeVethInterface(s) ||
+			looksLikeNanosecondTimestampFragment(s) {
 			return leadingChars + s
 		}
 
@@ -1068,7 +1168,9 @@ func (m *Mapper) Replace(content string) string {
 			looksLikeGitDescribeSuffix(s) ||
 			looksLikeFirewallChainName(s) ||
 			looksLikeKubectlColumnHeader(s) ||
-			looksLikeAcronymSuffixedWord(s) {
+			looksLikeAcronymSuffixedWord(s) ||
+			looksLikeKernelWorkerThread(s) ||
+			looksLikeDockerInspectField(s) {
 			return leadingChars + s
 		}
 
@@ -1085,6 +1187,10 @@ func (m *Mapper) Replace(content string) string {
 
 		return leadingChars + m.get(s, "HOST", m.host)
 	})
+
+	for i, block := range pemPublicBlocks {
+		content = strings.Replace(content, fmt.Sprintf("\x00%d\x00", i), block, 1)
+	}
 
 	return content
 }
